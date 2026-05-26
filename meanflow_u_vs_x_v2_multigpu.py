@@ -28,7 +28,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, os.path.dirname(__file__))
-from swiss_roll_meanflow import make_swiss_roll, SwissRollMeanFlowLoss, SinusoidalEmbedding
+from meanflow_minimal import make_swiss_roll, SwissRollMeanFlowLoss, SinusoidalEmbedding
 
 
 # ---------------------------------------------------------------------------
