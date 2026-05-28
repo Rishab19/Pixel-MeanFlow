@@ -246,66 +246,38 @@ def sample_one_step(
     cfg_scale : float = 3.0,
     device    : str   = "cuda",
     t_val     : float = 1.0,
+    t_min     : float = 0.02, # Match your loss config
 ) -> torch.Tensor:
 
     net.eval()
     net = net.to(device)
 
-    # pure noise start
-    z = torch.randn(
-        n,
-        net.data_dim,
-        device=device
-    )
+    # 1. Start with pure noise at t = 1.0
+    z = torch.randn(n, net.data_dim, device=device)
 
-    # generation uses r = 0
-    r = torch.zeros(
-        (n, 1),
-        device=device
-    )
+    # For a 1-NFE step from noise to data, we evaluate at t=1.0, looking toward r=0.0
+    t_tensor = torch.full((n, 1), t_val, device=device)
+    r_tensor = torch.zeros((n, 1), device=device)
+    w_tensor = torch.ones((n, 1), device=device)
 
-    t = torch.full(
-        (n, 1),
-        t_val,
-        device=device
-    )
+    cond_labels = torch.full((n,), label, dtype=torch.long, device=device)
+    uncond_labels = torch.full((n,), net.num_classes, dtype=torch.long, device=device)
 
-    w = torch.ones((n, 1), device=device)
+    # 2. Get the clean x-predictions from the network
+    x_cond = net(z, r_tensor, t_tensor, w_tensor, cond_labels)
+    x_uncond = net(z, r_tensor, t_tensor, w_tensor, uncond_labels)
 
-    cond_labels = torch.full(
-        (n,),
-        label,
-        dtype=torch.long,
-        device=device
-    )
+    # 3. Convert x-predictions to velocities (u = (z - x) / t)
+    # This mirrors exactly how your loss function interprets the net's output
+    u_cond = (z - x_cond) / t_tensor.clamp(min=t_min)
+    u_uncond = (z - x_uncond) / t_tensor.clamp(min=t_min)
 
-    # unconditional null token
-    uncond_labels = torch.full(
-        (n,),
-        net.num_classes,
-        dtype=torch.long,
-        device=device
-    )
+    # 4. Apply CFG blending in the VELOCITY space
+    u_guided = u_uncond + cfg_scale * (u_cond - u_uncond)
 
-    # x-predictions
-    x_cond = net(
-        z,
-        r,
-        t,
-        w,
-        cond_labels
-    )
-
-    x_uncond = net(
-        z,
-        r,
-        t,
-        w,
-        uncond_labels
-    )
-
-    # CFG blend
-    x_hat = x_uncond + cfg_scale * (x_cond - x_uncond)
+    # 5. Take your single mandatory NFE step from t=1 down to t=0
+    # Since dt = 1.0 (from 1 to 0), x_hat = z - u * 1.0
+    x_hat = z - u_guided * 1.0
 
     return x_hat
 
