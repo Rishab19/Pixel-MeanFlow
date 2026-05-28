@@ -310,35 +310,37 @@ def sample_one_step(
     return x_hat
 
 
-def visualize_generated_shapes(net, dataset, cfg_scale=3.0, n_samples=2048, save_path="generated_shapes.png"):
-    """
-    Generates and plots a side-by-side 3D comparison of the 1-step generated shapes.
-    
-    Args:
-        net: The trained MeanFlowGuidanceMLP model.
-        dataset: An instance of ThreeDShapeDataset (used to pull class names and normalization constants).
-        cfg_scale: Guidance scale (w) for Classifier-Free Guidance.
-        n_samples: Number of points to sample per shape class.
-        save_path: Filepath where the final plot will be saved.
-    """
-    import matplotlib.pyplot as plt
-    
+def visualize_generated_shapes(
+    net,
+    dataset,
+    cfg_scale=3.0,
+    n_samples=2048,
+    save_path="generated_shapes.html"
+):
+    import torch
+    import numpy as np
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
     device = next(net.parameters()).device
-    class_names = dataset.CLASS_NAMES # ['Swiss Roll', 'Möbius Strip', 'Torus']
+    class_names = dataset.CLASS_NAMES
     num_classes = len(class_names)
-    
-    # Grab dataset statistics for accurate physical reconstruction
+
     ds_mean = torch.tensor(dataset.mean, device=device)
     ds_std = torch.tensor(dataset.std, device=device)
-    
-    # Set up matplotlib 3D Canvas
-    fig = plt.figure(figsize=(6 * num_classes, 6))
-    
-    # Distinct color palette for each geometric flow
-    colors = ['#FF4B4B', '#0083B0', '#00B4DB'] 
-    
+
+    colors = ['#FF4B4B', '#0083B0', '#00B4DB']
+
+    # ---- Build interactive subplot grid ----
+    fig = make_subplots(
+        rows=1,
+        cols=num_classes,
+        specs=[[{'type': 'scene'}] * num_classes],
+        subplot_titles=[f"{name}\n(CFG={cfg_scale})" for name in class_names]
+    )
+
     for label, name in enumerate(class_names):
-        # 1. Generate normalized 3D samples using your 1-NFE sampler
+
         samples_norm = sample_one_step(
             net=net,
             n=n_samples,
@@ -346,36 +348,35 @@ def visualize_generated_shapes(net, dataset, cfg_scale=3.0, n_samples=2048, save
             cfg_scale=cfg_scale,
             device=device
         )
-        
-        # 2. Denormalize samples to recover original physical scales
-        samples_orig = (samples_norm * ds_std + ds_mean).cpu().numpy()
-        
-        # 3. Add a dedicated 3D subplot
-        ax = fig.add_subplot(1, num_classes, label + 1, projection='3d')
-        
-        # Draw the generated point cloud
-        ax.scatter(
-            samples_orig[:, 0], 
-            samples_orig[:, 1], 
-            samples_orig[:, 2], 
-            c=colors[label % len(colors)], 
-            alpha=0.6, 
-            s=4, 
-            edgecolor='none'
+
+        samples_orig = (samples_norm * ds_std + ds_mean).detach().cpu().numpy()
+
+        fig.add_trace(
+            go.Scatter3d(
+                x=samples_orig[:, 0],
+                y=samples_orig[:, 1],
+                z=samples_orig[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=2.5,
+                    color=colors[label % len(colors)],
+                    opacity=0.6
+                ),
+                name=name
+            ),
+            row=1,
+            col=label + 1
         )
-        
-        # Aesthetic tuning for 3D visibility
-        ax.set_title(f"{name}\n(CFG={cfg_scale})", fontsize=14, fontweight='bold', pad=10)
-        ax.grid(True, linestyle='--', alpha=0.5)
-        
-        # Balance axes ratios evenly to prevent squishing structural shapes
-        for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
-            axis.set_tick_params(labelsize=9)
-            
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f" Saved 3D shape generation plot to: {save_path}")
+
+    fig.update_layout(
+        height=600,
+        width=600 * num_classes,
+        title="Generated 3D Shapes (Interactive)",
+        showlegend=False
+    )
+
+    fig.write_html(save_path)
+    print(f" Saved interactive 3D plot to: {save_path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
