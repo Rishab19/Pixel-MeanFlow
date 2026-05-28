@@ -246,11 +246,30 @@ def sample_one_step(
     net.eval()
     net = net.to(device)
 
-    z = torch.randn(n, net.data_dim, device=device)
+    # pure noise start
+    z = torch.randn(
+        n,
+        net.data_dim,
+        device=device
+    )
 
-    t = torch.full((n, 1), t_val, device=device)
-    h = t.clone()
-    w = torch.full((n, 1), cfg_scale, device=device)
+    # generation uses r = 0
+    r = torch.zeros(
+        (n, 1),
+        device=device
+    )
+
+    t = torch.full(
+        (n, 1),
+        t_val,
+        device=device
+    )
+
+    w = torch.full(
+        (n, 1),
+        cfg_scale,
+        device=device
+    )
 
     cond_labels = torch.full(
         (n,),
@@ -259,6 +278,7 @@ def sample_one_step(
         device=device
     )
 
+    # unconditional null token
     uncond_labels = torch.full(
         (n,),
         net.num_classes,
@@ -267,14 +287,29 @@ def sample_one_step(
     )
 
     # x-predictions
-    x_cond = net(z, t, h, w, cond_labels)
-    x_uncond = net(z, t, h, w, uncond_labels)
+    x_cond = net(
+        z,
+        r,
+        t,
+        w,
+        cond_labels
+    )
 
-    # CFG
-    x_hat = x_uncond + cfg_scale * (x_cond - x_uncond)
+    x_uncond = net(
+        z,
+        r,
+        t,
+        w,
+        uncond_labels
+    )
+
+    # CFG blend
+    x_hat = (
+        x_uncond
+        + cfg_scale * (x_cond - x_uncond)
+    )
 
     return x_hat
-
 
 
 def visualize_generated_shapes(net, dataset, cfg_scale=3.0, n_samples=2048, save_path="generated_shapes.png"):
