@@ -25,7 +25,8 @@ from torch.utils.data.distributed import DistributedSampler
 
 # ── project modules ──────────────────────────────────────────────────────── #
 # Assumes loss_cfg.py, net_cfg.py, dataset_3d.py are on PYTHONPATH / cwd.
-from algorithm2    import SwissRollMeanFlowGuidanceLoss   # the loss you provided
+# from algorithm2    import SwissRollMeanFlowGuidanceLoss   # the loss you provided
+from algorithm2 import PixelMeanFlowGuidanceLoss
 from alg2_net     import MeanFlowGuidanceMLP             # the net  you provided
 from plot_3d  import ThreeDShapeDataset
 import matplotlib.pyplot as plt
@@ -112,12 +113,14 @@ def train(args):
     )
 
     # ── Loss ─────────────────────────────────────────────────────────────
-    loss_fn = SwissRollMeanFlowGuidanceLoss(
-        noise_dist       = args.noise_dist,
-        data_proportion  = args.data_proportion,
-        t_min            = args.t_min,
-        cfg_scale_max    = args.cfg_scale_max,
-    )
+    loss_fn = PixelMeanFlowGuidanceLoss(
+    num_classes         = ThreeDShapeDataset.NUM_CLASSES,
+    noise_dist          = args.noise_dist,
+    data_proportion     = args.data_proportion,
+    class_dropout_prob  = args.class_dropout_prob,
+    t_min               = args.t_min,
+    w_max               = args.w_max,
+)
 
     # ── Training loop ────────────────────────────────────────────────────
     step = 0
@@ -142,7 +145,7 @@ def train(args):
         x = x.to(device, non_blocking=True)   # (B, 3)
         c = c.to(device, non_blocking=True)   # (B,)  integer labels
 
-        opt.zero_grad()
+        opt.zero_grad(set_to_none=True)
 
         # loss_fn expects the raw nn.Module, not the DDP wrapper, so that
         # torch.func.jvp can trace through it cleanly.
@@ -168,13 +171,24 @@ def train(args):
             os.makedirs(args.ckpt_dir, exist_ok=True)
             torch.save(
                 {
-                    "step":       step,
-                    "model":      net.module.state_dict(),
-                    "opt":        opt.state_dict(),
-                    "sched":      sched.state_dict(),
-                    "args":       vars(args),
-                    "ds_mean":    dataset.mean,
-                    "ds_std":     dataset.std,
+                    "step": step,
+                    "model": net.module.state_dict(),
+                    "opt": opt.state_dict(),
+                    "sched": sched.state_dict(),
+                
+                    # training args
+                    "args": vars(args),
+                
+                    # explicit architecture metadata
+                    "data_dim": ThreeDShapeDataset.DATA_DIM,
+                    "num_classes": ThreeDShapeDataset.NUM_CLASSES,
+                    "hidden": args.hidden,
+                    "depth": args.depth,
+                    "emb_dim": args.emb_dim,
+                
+                    # normalization stats
+                    "ds_mean": dataset.mean,
+                    "ds_std": dataset.std,
                 },
                 ckpt_path,
             )
@@ -188,14 +202,25 @@ def train(args):
         final_path = os.path.join(args.ckpt_dir, "ckpt_final.pt")
         torch.save(
             {
-                "step":    step,
-                "model":   net.module.state_dict(),
-                "opt":     opt.state_dict(),
-                "sched":   sched.state_dict(),
-                "args":    vars(args),
+                "step": step,
+                "model": net.module.state_dict(),
+                "opt": opt.state_dict(),
+                "sched": sched.state_dict(),
+                
+                # training args
+                "args": vars(args),
+                
+                # explicit architecture metadata
+                "data_dim": ThreeDShapeDataset.DATA_DIM,
+                "num_classes": ThreeDShapeDataset.NUM_CLASSES,
+                "hidden": args.hidden,
+                "depth": args.depth,
+                "emb_dim": args.emb_dim,
+                
+                # normalization stats
                 "ds_mean": dataset.mean,
-                "ds_std":  dataset.std,
-            },
+                "ds_std": dataset.std,
+                },
             final_path,
         )
         log(f"Training done. Final checkpoint → {final_path}")
@@ -217,48 +242,37 @@ def sample_one_step(
     device    : str   = "cuda",
     t_val     : float = 1.0,
 ) -> torch.Tensor:
-    """
-    One-step MeanFlow generation with CFG.
 
-    The mean-flow model is an x-predictor: net(z, t, h, w, c) → x̂.
-    At generation time we set r=0, so h = t - r = t.
-
-    The CFG-blended prediction is:
-
-        x̂_cfg = x̂_uncond + w * (x̂_cond - x̂_uncond)
-
-    which matches the standard classifier-free guidance formula when
-    the model is an x-predictor.
-
-    Args:
-        net       : trained MeanFlowGuidanceMLP (unwrapped from DDP)
-        n         : number of samples to draw
-        label     : integer class label to condition on (0=SwissRoll,
-                    1=Möbius Strip, 2=Torus)
-        cfg_scale : guidance strength  w  (1.0 = no guidance)
-        device    : target device
-        t_val     : start time (1.0 = pure noise)
-
-    Returns:
-        x_hat : (n, 3) generated samples in *normalised* space.
-                Call dataset.denormalize(x_hat) to get the original scale.
-    """
     net.eval()
     net = net.to(device)
 
     z = torch.randn(n, net.data_dim, device=device)
 
     t = torch.full((n, 1), t_val, device=device)
-    h = t.clone()                                        # r = 0  ⟹  h = t
+    h = t.clone()
     w = torch.full((n, 1), cfg_scale, device=device)
-    c = torch.full((n,),   label,     dtype=torch.long, device=device)
 
-    # Conditional and unconditional x-predictions
-    x_cond   = net(z, t, h, w, c)      # (n, D)
-    x_uncond = net(z, t, h, w, None)   # (n, D)  — null token
+    cond_labels = torch.full(
+        (n,),
+        label,
+        dtype=torch.long,
+        device=device
+    )
 
-    # CFG blend in x-prediction space
+    uncond_labels = torch.full(
+        (n,),
+        net.num_classes,
+        dtype=torch.long,
+        device=device
+    )
+
+    # x-predictions
+    x_cond = net(z, t, h, w, cond_labels)
+    x_uncond = net(z, t, h, w, uncond_labels)
+
+    # CFG
     x_hat = x_uncond + cfg_scale * (x_cond - x_uncond)
+
     return x_hat
 
 
@@ -340,7 +354,7 @@ def run_inference(args):
 
     print(f"Loading checkpoint: {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location="cpu")
-    cfg  = ckpt["args"]
+    cfg  = ckpt.get("args", {})
 
     # Reconstruct dataset to fetch normalisation metrics dynamically
     dataset = ThreeDShapeDataset(
@@ -350,12 +364,12 @@ def run_inference(args):
     )
 
     net = MeanFlowGuidanceMLP(
-        data_dim    = cfg.get("data_dim",    3),
-        num_classes = cfg.get("num_classes", 3),
-        hidden      = cfg.get("hidden",      512),
-        depth       = cfg.get("depth",       5),
-        emb_dim     = cfg.get("emb_dim",     128),
-    ).to(device)
+    data_dim    = ckpt["data_dim"],
+    num_classes = ckpt["num_classes"],
+    hidden      = ckpt["hidden"],
+    depth       = ckpt["depth"],
+    emb_dim     = ckpt["emb_dim"],
+).to(device)
     net.load_state_dict(ckpt["model"])
 
     # ──── NEW: Call the visualizer ────
@@ -393,7 +407,9 @@ def parse_args():
     p.add_argument("--noise_dist",      default="uniform")
     p.add_argument("--data_proportion", type=float, default=0.25)
     p.add_argument("--t_min",           type=float, default=0.02)
-    p.add_argument("--cfg_scale_max",   type=float, default=7.0)
+    # p.add_argument("--cfg_scale_max",   type=float, default=7.0)
+    p.add_argument("--w_max", type=float, default=7.0)
+    p.add_argument("--class_dropout_prob", type=float, default=0.1)
 
     # ── Optimisation ──────────────────────────────────────────────────────
     p.add_argument("--batch_size",   type=int,   default=1024)
