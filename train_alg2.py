@@ -270,11 +270,7 @@ def sample_one_step(
         device=device
     )
 
-    w = torch.full(
-        (n, 1),
-        cfg_scale,
-        device=device
-    )
+    w = torch.ones((n, 1), device=device)
 
     cond_labels = torch.full(
         (n,),
@@ -309,10 +305,7 @@ def sample_one_step(
     )
 
     # CFG blend
-    x_hat = (
-        x_uncond
-        + cfg_scale * (x_cond - x_uncond)
-    )
+    x_hat = x_uncond + cfg_scale * (x_cond - x_uncond)
 
     return x_hat
 
