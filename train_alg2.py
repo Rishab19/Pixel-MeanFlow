@@ -30,6 +30,7 @@ from algorithm2 import PixelMeanFlowGuidanceLoss
 from alg2_net     import MeanFlowGuidanceMLP             # the net  you provided
 from plot_3d  import ThreeDShapeDataset
 import matplotlib.pyplot as plt
+import numpy as np
 
 # ══════════════════════════════════════════════════════════════════════════ #
 #  Helpers                                                                   #
@@ -392,7 +393,15 @@ def run_inference(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"Loading checkpoint: {args.ckpt}")
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    torch.serialization.add_safe_globals([
+    np.core.multiarray._reconstruct
+])
+
+    ckpt = torch.load(
+    args.ckpt,
+    map_location="cpu",
+    weights_only=False
+)
     cfg  = ckpt.get("args", {})
 
     # Reconstruct dataset to fetch normalisation metrics dynamically
