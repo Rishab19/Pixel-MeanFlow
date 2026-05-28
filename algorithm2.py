@@ -128,21 +128,19 @@ class PixelMeanFlowGuidanceLoss:
 # Alternate implementation
 
 import math
-
 import torch
 import torch.nn as nn
-
 
 class SwissRollMeanFlowGuidanceLoss:
     """
     Pixel MeanFlow w/ CFG — Algorithm 2.
-
-    u(z,r,t,w,c) = (z - net(z,t,h,w,c)) / t     average velocity
-    v_c = u(z,t,t,w,c)                            cond  instantaneous velocity
-    v_u = u(z,t,t,w,None)                         uncond instantaneous velocity
-    v_g = (e-x) + (1 - 1/w)*(v_c - v_u)          CFG target  [stopgrad]
-    u, dudt = jvp(u_fn, (z,r,t,w), (v_c,0,1,0))  JVP wrt t   [c closed over]
-    V   = u + (t-r)*stopgrad(dudt)
+    
+    u(z, r, t, w, c) = (z - net(z, t, h, w, c)) / t    average velocity
+    v_c = u(z, t, t, w, c)                            cond instantaneous velocity
+    v_u = u(z, t, t, w, None)                         uncond instantaneous velocity
+    v_g = (e - x) + (1 - 1/w) * (v_c - v_u)           CFG target  [stopgrad]
+    u, dudt = jvp(u_fn, (z, r, t, w), (v_c, 0, 1, 0)) JVP wrt t   [c closed over]
+    V   = u + (t - r) * stopgrad(dudt)
     loss = ||V - stopgrad(v_g)||^2
     """
 
@@ -172,6 +170,7 @@ class SwissRollMeanFlowGuidanceLoss:
         s2 = self._sample_time((B, 1), device)
         t  = torch.max(s1, s2)
         r  = torch.min(s1, s2)
+        
         # data_proportion slice: r=t (self-prediction / flow-matching samples)
         mask = (torch.arange(B, device=device) < int(B * self.data_proportion)).unsqueeze(1)
         r = torch.where(mask, t, r)
@@ -186,7 +185,7 @@ class SwissRollMeanFlowGuidanceLoss:
         """
         Args:
             net : callable  net(z, t, h, w, c) -> x_pred
-                  c=None means unconditional (network must handle null condition)
+                  c=None means unconditional (network handles null condition)
             x   : clean data  (B, D)
             c   : condition   (B,) e.g. integer class labels
         Returns:
@@ -194,42 +193,151 @@ class SwissRollMeanFlowGuidanceLoss:
         """
         B, device = x.shape[0], x.device
 
+        # ── 1. Sample Dynamics Parameters ──────────────────────────────────
         t, r = self._sample_t_r(B, device)       # (B, 1)
         w    = self._sample_cfg_scale(B, device)  # (B, 1)
         e    = torch.randn_like(x)
         z_t  = (1.0 - t) * x + t * e
 
-        def u_fn(z, r_, t_, w_, cond):
-            x_pred = net(z, t_, t_ - r_, w_, cond)
-            return (z - x_pred) / t_.clamp(min=self.t_min)
+        # ── 2. Functional Average Velocity Field Definition ────────────────
+        def u_fn(z_input, r_input, t_input, w_input, condition_input):
+            h_input = t_input - r_input
+            x_pred = net(z_input, t_input, h_input, w_input, condition_input)
+            return (z_input - x_pred) / t_input.clamp(min=self.t_min)
 
-        # ------------------------------------------------------------------
-        # CFG target v_g  (fully stopgrad'd — no grads needed here)
-        # ------------------------------------------------------------------
-        with torch.no_grad():
-            v_c = u_fn(z_t, t, t, w, c)     # conditional,   h=0 (r=t)
-            v_u = u_fn(z_t, t, t, w, None)  # unconditional, h=0 (r=t)
+        # ── 3. Compute CFG Target Vectors via Detach ───────────────────────
+        # Evaluated safely on-graph so tracking stays perfect, but isolated via .detach()
+        v_c = u_fn(z_t, t, t, w, c)              # Conditional, h=0 (r=t)
+        v_u = u_fn(z_t, t, t, w, None)           # Unconditional, h=0 (r=t)
 
-        v_g = ((e - x) + (1.0 - 1.0 / w) * (v_c - v_u)).detach()  # stopgrad
+        # The complete stopgrad'd target velocity composition matching Algorithm 2
+        v_g = ((e - x) + (1.0 - 1.0 / w) * (v_c - v_u)).detach()
 
-        # ------------------------------------------------------------------
-        # JVP wrt t — close over (w, c) so all differentiated primals are float.
-        # v_c is recomputed with grad so the JVP can differentiate through net.
-        # ------------------------------------------------------------------
-        def u_fn_t(z, r_, t_):
-            """u_fn with w and c closed over; only (z, r, t) differentiated."""
-            return u_fn(z, r_, t_, w, c)
+        # ── 4. JVP Evaluation Wrapper Over Time Variables ──────────────────
+        def u_fn_t(z_arg, r_arg, t_arg):
+            """u_fn with w and c closed over; only (z, r, t) are tracked primals."""
+            return u_fn(z_arg, r_arg, t_arg, w, c)
 
-        v_c_grad = u_fn_t(z_t, t, t)  # recompute conditional velocity with grad
+        # Recompute instantaneous conditional velocity on-graph for primal tracking 
+        v_c_grad = u_fn_t(z_t, t, t)
 
         primals  = (z_t,      r,                   t                  )
         tangents = (v_c_grad, torch.zeros_like(r), torch.ones_like(t) )
 
+        # Execute Jacobian-Vector Product across time tracking primals
         u, dudt = torch.func.jvp(u_fn_t, primals, tangents)
 
-        # ------------------------------------------------------------------
-        # Compound V and loss
-        # ------------------------------------------------------------------
-        V    = u + (t - r) * dudt.detach()        # stopgrad(dudt)
-        loss = (V - v_g).pow(2).sum(dim=1).mean()
+        # ── 5. Compound Loss Vector Calculation ────────────────────────────
+        # Apply the stopgrad step to the derivative tracking path via .detach()
+        V = u + (t - r) * dudt.detach()
+        
+        # Flatten feature dims to provide clean dimensional invariance (e.g. 1D, 2D, 3D, etc.)
+        loss = (V - v_g).pow(2).flatten(1).sum(dim=1).mean()
         return loss
+
+# import math
+
+# import torch
+# import torch.nn as nn
+
+
+# class SwissRollMeanFlowGuidanceLoss:
+#     """
+#     Pixel MeanFlow w/ CFG — Algorithm 2.
+
+#     u(z,r,t,w,c) = (z - net(z,t,h,w,c)) / t     average velocity
+#     v_c = u(z,t,t,w,c)                            cond  instantaneous velocity
+#     v_u = u(z,t,t,w,None)                         uncond instantaneous velocity
+#     v_g = (e-x) + (1 - 1/w)*(v_c - v_u)          CFG target  [stopgrad]
+#     u, dudt = jvp(u_fn, (z,r,t,w), (v_c,0,1,0))  JVP wrt t   [c closed over]
+#     V   = u + (t-r)*stopgrad(dudt)
+#     loss = ||V - stopgrad(v_g)||^2
+#     """
+
+#     def __init__(
+#         self,
+#         noise_dist: str = "uniform",
+#         data_proportion: float = 0.25,
+#         t_min: float = 0.02,
+#         cfg_scale_max: float = 7.0,
+#     ):
+#         self.noise_dist = noise_dist
+#         self.data_proportion = data_proportion
+#         self.t_min = t_min
+#         self.cfg_scale_max = cfg_scale_max
+
+#     def _sample_time(self, shape, device):
+#         if self.noise_dist == "uniform":
+#             return self.t_min + (1.0 - self.t_min) * torch.rand(shape, device=device)
+#         elif self.noise_dist == "logit_normal":
+#             return torch.sigmoid(
+#                 torch.randn(shape, device=device) * 1.0 - 0.4
+#             ).clamp(self.t_min, 1.0)
+#         raise ValueError(self.noise_dist)
+
+#     def _sample_t_r(self, B, device):
+#         s1 = self._sample_time((B, 1), device)
+#         s2 = self._sample_time((B, 1), device)
+#         t  = torch.max(s1, s2)
+#         r  = torch.min(s1, s2)
+#         # data_proportion slice: r=t (self-prediction / flow-matching samples)
+#         mask = (torch.arange(B, device=device) < int(B * self.data_proportion)).unsqueeze(1)
+#         r = torch.where(mask, t, r)
+#         return t, r
+
+#     def _sample_cfg_scale(self, B, device):
+#         # w ~ exp(U * log(1 + w_max)), giving log-uniform coverage over [1, w_max]
+#         u = torch.rand((B, 1), device=device)
+#         return torch.exp(u * math.log(1.0 + self.cfg_scale_max))
+
+#     def __call__(self, net: nn.Module, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             net : callable  net(z, t, h, w, c) -> x_pred
+#                   c=None means unconditional (network must handle null condition)
+#             x   : clean data  (B, D)
+#             c   : condition   (B,) e.g. integer class labels
+#         Returns:
+#             loss : scalar
+#         """
+#         B, device = x.shape[0], x.device
+
+#         t, r = self._sample_t_r(B, device)       # (B, 1)
+#         w    = self._sample_cfg_scale(B, device)  # (B, 1)
+#         e    = torch.randn_like(x)
+#         z_t  = (1.0 - t) * x + t * e
+
+#         def u_fn(z, r_, t_, w_, cond):
+#             x_pred = net(z, t_, t_ - r_, w_, cond)
+#             return (z - x_pred) / t_.clamp(min=self.t_min)
+
+#         # ------------------------------------------------------------------
+#         # CFG target v_g  (fully stopgrad'd — no grads needed here)
+#         # ------------------------------------------------------------------
+#         with torch.no_grad():
+#             v_c = u_fn(z_t, t, t, w, c)     # conditional,   h=0 (r=t)
+#             v_u = u_fn(z_t, t, t, w, None)  # unconditional, h=0 (r=t)
+
+#         v_g = ((e - x) + (1.0 - 1.0 / w) * (v_c - v_u)).detach()  # stopgrad
+
+#         # ------------------------------------------------------------------
+#         # JVP wrt t — close over (w, c) so all differentiated primals are float.
+#         # v_c is recomputed with grad so the JVP can differentiate through net.
+#         # ------------------------------------------------------------------
+#         def u_fn_t(z, r_, t_):
+#             """u_fn with w and c closed over; only (z, r, t) differentiated."""
+#             return u_fn(z, r_, t_, w, c)
+
+#         v_c_grad = u_fn_t(z_t, t, t)  # recompute conditional velocity with grad
+
+#         primals  = (z_t,      r,                   t                  )
+#         tangents = (v_c_grad, torch.zeros_like(r), torch.ones_like(t) )
+
+#         u, dudt = torch.func.jvp(u_fn_t, primals, tangents)
+
+#         # ------------------------------------------------------------------
+#         # Compound V and loss
+#         # ------------------------------------------------------------------
+#         V    = u + (t - r) * dudt.detach()        # stopgrad(dudt)
+#         loss = (V - v_g).pow(2).sum(dim=1).mean()
+#         return loss
