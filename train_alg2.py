@@ -107,7 +107,11 @@ def train(args):
     net = DDP(net, device_ids=[local_rank])
 
     # ── Optimiser & scheduler ────────────────────────────────────────────
-    opt   = torch.optim.Adam(net.parameters(), lr=args.lr)
+    opt = torch.optim.AdamW(
+            net.parameters(),
+            lr=args.lr,
+            weight_decay=1e-4
+        )
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, build_lr_lambda(args.warmup_steps, args.n_steps)
     )
