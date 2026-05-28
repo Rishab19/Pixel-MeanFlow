@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 from algorithm2    import SwissRollMeanFlowGuidanceLoss   # the loss you provided
 from alg2_net     import MeanFlowGuidanceMLP             # the net  you provided
 from plot_3d  import ThreeDShapeDataset
-
+import matplotlib.pyplot as plt
 
 # ══════════════════════════════════════════════════════════════════════════ #
 #  Helpers                                                                   #
@@ -262,6 +262,75 @@ def sample_one_step(
     return x_hat
 
 
+
+def visualize_generated_shapes(net, dataset, cfg_scale=3.0, n_samples=2048, save_path="generated_shapes.png"):
+    """
+    Generates and plots a side-by-side 3D comparison of the 1-step generated shapes.
+    
+    Args:
+        net: The trained MeanFlowGuidanceMLP model.
+        dataset: An instance of ThreeDShapeDataset (used to pull class names and normalization constants).
+        cfg_scale: Guidance scale (w) for Classifier-Free Guidance.
+        n_samples: Number of points to sample per shape class.
+        save_path: Filepath where the final plot will be saved.
+    """
+    import matplotlib.pyplot as plt
+    
+    device = next(net.parameters()).device
+    class_names = dataset.CLASS_NAMES # ['Swiss Roll', 'Möbius Strip', 'Torus']
+    num_classes = len(class_names)
+    
+    # Grab dataset statistics for accurate physical reconstruction
+    ds_mean = torch.tensor(dataset.mean, device=device)
+    ds_std = torch.tensor(dataset.std, device=device)
+    
+    # Set up matplotlib 3D Canvas
+    fig = plt.figure(figsize=(6 * num_classes, 6))
+    
+    # Distinct color palette for each geometric flow
+    colors = ['#FF4B4B', '#0083B0', '#00B4DB'] 
+    
+    for label, name in enumerate(class_names):
+        # 1. Generate normalized 3D samples using your 1-NFE sampler
+        samples_norm = sample_one_step(
+            net=net,
+            n=n_samples,
+            label=label,
+            cfg_scale=cfg_scale,
+            device=device
+        )
+        
+        # 2. Denormalize samples to recover original physical scales
+        samples_orig = (samples_norm * ds_std + ds_mean).cpu().numpy()
+        
+        # 3. Add a dedicated 3D subplot
+        ax = fig.add_subplot(1, num_classes, label + 1, projection='3d')
+        
+        # Draw the generated point cloud
+        ax.scatter(
+            samples_orig[:, 0], 
+            samples_orig[:, 1], 
+            samples_orig[:, 2], 
+            c=colors[label % len(colors)], 
+            alpha=0.6, 
+            s=4, 
+            edgecolor='none'
+        )
+        
+        # Aesthetic tuning for 3D visibility
+        ax.set_title(f"{name}\n(CFG={cfg_scale})", fontsize=14, fontweight='bold', pad=10)
+        ax.grid(True, linestyle='--', alpha=0.5)
+        
+        # Balance axes ratios evenly to prevent squishing structural shapes
+        for axis in [ax.xaxis, ax.yaxis, ax.zaxis]:
+            axis.set_tick_params(labelsize=9)
+            
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f" Saved 3D shape generation plot to: {save_path}")
+
+
 # ══════════════════════════════════════════════════════════════════════════ #
 #  Quick inference smoke-test (single-GPU, loads a checkpoint)              #
 # ══════════════════════════════════════════════════════════════════════════ #
@@ -273,35 +342,32 @@ def run_inference(args):
     ckpt = torch.load(args.ckpt, map_location="cpu")
     cfg  = ckpt["args"]
 
+    # Reconstruct dataset to fetch normalisation metrics dynamically
+    dataset = ThreeDShapeDataset(
+        n_samples=100,  # Minimal sample footprint since we only need metadata
+        noise=cfg.get("noise", 0.05),
+        normalize=True
+    )
+
     net = MeanFlowGuidanceMLP(
         data_dim    = cfg.get("data_dim",    3),
         num_classes = cfg.get("num_classes", 3),
         hidden      = cfg.get("hidden",      512),
         depth       = cfg.get("depth",       5),
         emb_dim     = cfg.get("emb_dim",     128),
-    )
+    ).to(device)
     net.load_state_dict(ckpt["model"])
 
-    ds_mean = torch.tensor(ckpt["ds_mean"])
-    ds_std  = torch.tensor(ckpt["ds_std"])
+    # ──── NEW: Call the visualizer ────
+    visualize_generated_shapes(
+        net=net,
+        dataset=dataset,
+        cfg_scale=args.cfg_scale,
+        n_samples=args.n_samples,
+        save_path="generated_shapes_output.png"
+    )
 
-    class_names = ThreeDShapeDataset.CLASS_NAMES
-    for label, name in enumerate(class_names):
-        samples = sample_one_step(
-            net,
-            n         = args.n_samples,
-            label     = label,
-            cfg_scale = args.cfg_scale,
-            device    = device,
-        )
-        # Denormalise
-        samples_orig = samples.cpu() * ds_std + ds_mean
-        print(
-            f"[{name:14s}]  mean={samples_orig.mean(0).tolist()}  "
-            f"std={samples_orig.std(0).tolist()}"
-        )
-
-    print("Inference done.")
+    print("Inference and plot export done.")
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
