@@ -1,19 +1,23 @@
 import torch
 import torch.nn as nn
-import numpy as np
 
-# Implementation 1 of the Pixel MeanFlow Guidance Loss as described in the reference paper.
+
 class PixelMeanFlowGuidanceLoss:
     """
-    Pixel MeanFlow Guidance Loss (Algorithm 2) for conditional generation / CFG.
+    Stable Pixel MeanFlow Guidance Loss (Algorithm 2).
 
-    u(z, r, t, w, c) = (z - net(z, t, h, w, c)) / t
-    v_c              = u(z, t, t, w, c)
-    v_u              = u(z, t, t, w, None)
-    v_g              = (e - x) + (1 - 1/w) * (v_c - v_u)
-    u, dudt          = jvp(u_fn, (z, r, t, w, c), (v_c, 0, 1, 0, 0))
-    V                = u + (t - r) * stopgrad(dudt)
-    loss             = ||V - stopgrad(v_g)||^2
+    Assumes the network signature is:
+
+        net(z, r, t, w, c)
+
+    returning x-predictions.
+
+    Key stabilizations:
+    - explicit r,t parameterization
+    - tangent clipping before JVP
+    - dudt clipping
+    - global mean loss
+    - randomized self-prediction slice
     """
 
     def __init__(
@@ -22,113 +26,254 @@ class PixelMeanFlowGuidanceLoss:
         noise_dist: str = "uniform",
         data_proportion: float = 0.25,
         class_dropout_prob: float = 0.1,
-        t_min: float = 0.02,
+        t_min: float = 0.15,
         w_max: float = 7.0,
+        tangent_clip: float = 5.0,
+        dudt_clip: float = 50.0,
     ):
         self.num_classes = num_classes
-        self.uncond_class = num_classes  # Usually index 'num_classes' is reserved for null token
+        self.uncond_class = num_classes
+
         self.noise_dist = noise_dist
         self.data_proportion = data_proportion
         self.class_dropout_prob = class_dropout_prob
+
         self.t_min = t_min
         self.w_max = w_max
 
+        self.tangent_clip = tangent_clip
+        self.dudt_clip = dudt_clip
+
     def _sample_time(self, shape, device):
+
         if self.noise_dist == "uniform":
-            return self.t_min + (1.0 - self.t_min) * torch.rand(shape, device=device)
+            return self.t_min + (
+                1.0 - self.t_min
+            ) * torch.rand(shape, device=device)
+
         elif self.noise_dist == "logit_normal":
-            # Matching the P_mean = -0.4, P_std = 1.0 from reference paper
             rnd = torch.randn(shape, device=device)
-            return torch.sigmoid(rnd * 1.0 + (-0.4)).clamp(self.t_min, 1.0)
+            return torch.sigmoid(
+                rnd * 1.0 - 0.4
+            ).clamp(self.t_min, 1.0)
+
         raise ValueError(self.noise_dist)
 
     def _sample_t_r_w(self, B, device):
+
         shape = (B, 1)
+
         s1 = self._sample_time(shape, device)
         s2 = self._sample_time(shape, device)
-        t = torch.max(s1, s2)   # t >= r always
-        r = torch.min(s1, s2)
 
-        # Self-prediction slice: r = t
-        data_mask = (torch.rand((B, 1), device=device) < self.data_proportion)
+        t = torch.maximum(s1, s2)
+        r = torch.minimum(s1, s2)
+
+        # randomized self-prediction slice
+        data_mask = (
+            torch.rand((B, 1), device=device)
+            < self.data_proportion
+        )
+
         r = torch.where(data_mask, t, r)
 
-        # Sample CFG scale w uniformly between 1.0 and w_max (or using power law distribution)
-        # Here we use standard uniform space sampling matching continuous training variants
-        w = 1.0 + (self.w_max - 1.0) * torch.rand(shape, device=device)
+        # uniform CFG scale
+        w = 1.0 + (
+            self.w_max - 1.0
+        ) * torch.rand(shape, device=device)
+
         return t, r, w
 
-    def __call__(self, net: nn.Module, x: torch.Tensor, classes: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self,
+        net: nn.Module,
+        x: torch.Tensor,
+        classes: torch.Tensor,
+    ) -> torch.Tensor:
+
         B = x.shape[0]
         device = x.device
 
-        # 1. Sample dynamics variables
+        # ---------------------------------------------------
+        # Sample dynamics
+        # ---------------------------------------------------
+
         t, r, w = self._sample_t_r_w(B, device)
+
         e = torch.randn_like(x)
+
         z_t = (1.0 - t) * x + t * e
-        v_true = e - x  # Ground-truth unguided trajectory velocity
 
-        # Apply standard classification conditional dropout for training stability
-        drop_mask = torch.rand(B, device=device) < self.class_dropout_prob
-        c_dropped = torch.where(drop_mask, torch.tensor(self.uncond_class, device=device), classes)
+        v_true = e - x
 
-        # 2. Define the core average velocity field function u_fn
-        # In Pixel MeanFlow: u = (z - net(...)) / t
-        def u_fn_functional(z_input, r_input, t_input, w_input, condition_input):
-            h_input = t_input - r_input
-            # net receives: (noisy_latent, t, h, cfg_scale, condition)
-            x_pred = net(z_input, t_input, h_input, w_input, condition_input)
-            return (z_input - x_pred) / t_input
+        # ---------------------------------------------------
+        # classifier-free dropout
+        # ---------------------------------------------------
 
-        # 3. Calculate v_c and v_u to compute the CFG Target vector (r = t -> h = 0)
-        # Note: We wrap evaluations in torch.no_grad() or detach because 
-        # Alg 2 defines v_g strictly under a stopgrad operator.
-        with torch.no_grad():
-            # For v_c and v_u, r is set equal to t, forcing h = 0
-            v_c = u_fn_functional(z_t, t, t, w, c_dropped)
-            tangent_norm = v_c_inst.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            max_norm = 5.0
-            v_c_inst = v_c_inst * (
-                torch.clamp(max_norm / tangent_norm, max=1.0)
-            )
-            
-            # For unconditional path, pass the null token class
-            uncond_tokens = torch.full_like(c_dropped, self.uncond_class)
-            v_u = u_fn_functional(z_t, t, t, w, uncond_tokens)
-            
-            # Target generation sequence following Alg 2
-            v_g = v_true + (1.0 - 1.0 / w) * (v_c - v_u)
-
-        # 4. Instantaneous velocity conditional evaluation wrapper for JVP tracking 
-        # JVP takes floating tensors; we capture the discrete classes inside the closure
-        def u_fn_jvp_wrap(z_arg, r_arg, t_arg, w_arg):
-            return u_fn_functional(z_arg, r_arg, t_arg, w_arg, c_dropped)
-
-        # Compute instantaneous condition velocity for the primal tracking
-        # For the JVP call, r=t maps exactly to the paper's specification
-        with torch.no_grad():
-            v_c_inst = u_fn_jvp_wrap(z_t, t, t, w)
-
-        # 5. JVP evaluation over time variables 
-        # Primal inputs and corresponding tangent velocity vectors 
-        primals = (z_t, r, t, w)
-        tangents = (
-            v_c_inst,                     # dz/dt = v_c
-            torch.zeros_like(r),          # dr/dt = 0 (r is constant during t variation)
-            torch.ones_like(t),           # dt/dt = 1
-            torch.zeros_like(w)           # dw/dt = 0
+        drop_mask = (
+            torch.rand(B, device=device)
+            < self.class_dropout_prob
         )
 
-        u, dudt = torch.func.jvp(u_fn_jvp_wrap, primals, tangents)
+        null_tokens = torch.full_like(
+            classes,
+            self.uncond_class
+        )
 
-        # 6. Compound construction target 
-        # detach() applies the `stopgrad` to the derivative tracking path
+        c_dropped = torch.where(
+            drop_mask,
+            null_tokens,
+            classes
+        )
+
+        # ---------------------------------------------------
+        # average velocity field
+        # ---------------------------------------------------
+
+        def u_fn(
+            z_input,
+            r_input,
+            t_input,
+            w_input,
+            c_input,
+        ):
+
+            x_pred = net(
+                z_input,
+                r_input,
+                t_input,
+                w_input,
+                c_input,
+            )
+
+            return (
+                z_input - x_pred
+            ) / t_input
+
+        # ---------------------------------------------------
+        # CFG target
+        # ---------------------------------------------------
+
+        with torch.no_grad():
+
+            # conditional instantaneous velocity
+            v_c = u_fn(
+                z_t,
+                t,
+                t,
+                w,
+                c_dropped,
+            )
+
+            # unconditional instantaneous velocity
+            v_u = u_fn(
+                z_t,
+                t,
+                t,
+                w,
+                null_tokens,
+            )
+
+            v_g = (
+                v_true
+                + (1.0 - 1.0 / w) * (v_c - v_u)
+            )
+
+        # ---------------------------------------------------
+        # JVP wrapper
+        # ---------------------------------------------------
+
+        def u_fn_jvp(
+            z_arg,
+            r_arg,
+            t_arg,
+            w_arg,
+        ):
+            return u_fn(
+                z_arg,
+                r_arg,
+                t_arg,
+                w_arg,
+                c_dropped,
+            )
+
+        # ---------------------------------------------------
+        # tangent computation
+        # ---------------------------------------------------
+
+        with torch.no_grad():
+
+            v_c_inst = u_fn_jvp(
+                z_t,
+                t,
+                t,
+                w,
+            )
+
+            # tangent clipping
+            tangent_norm = v_c_inst.norm(
+                dim=-1,
+                keepdim=True,
+            ).clamp(min=1e-8)
+
+            clip_scale = torch.clamp(
+                self.tangent_clip / tangent_norm,
+                max=1.0,
+            )
+
+            v_c_inst = v_c_inst * clip_scale
+
+        # ---------------------------------------------------
+        # JVP
+        # ---------------------------------------------------
+
+        primals = (
+            z_t,
+            r,
+            t,
+            w,
+        )
+
+        tangents = (
+            v_c_inst,
+            torch.zeros_like(r),
+            torch.ones_like(t),
+            torch.zeros_like(w),
+        )
+
+        u, dudt = torch.func.jvp(
+            u_fn_jvp,
+            primals,
+            tangents,
+        )
+
+        # derivative stabilization
+        dudt = torch.nan_to_num(
+            dudt,
+            nan=0.0,
+            posinf=self.dudt_clip,
+            neginf=-self.dudt_clip,
+        )
+
+        dudt = torch.clamp(
+            dudt,
+            -self.dudt_clip,
+            self.dudt_clip,
+        )
+
+        # ---------------------------------------------------
+        # compound velocity
+        # ---------------------------------------------------
+
         V = u + (t - r) * dudt.detach()
 
-        # Compute Mean Squared Error against the guidance vector path
-        loss = (V - v_g.detach()).pow(2).flatten(1).sum(dim=1).mean()
-        return loss
+        # ---------------------------------------------------
+        # stable MSE
+        # ---------------------------------------------------
 
+        loss = (V - v_g.detach()).pow(2).mean()
+
+        return loss
 
 # Alternate implementation
 
