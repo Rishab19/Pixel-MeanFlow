@@ -78,7 +78,7 @@ class PixelMeanFlowGuidanceLoss:
             h_input = t_input - r_input
             # net receives: (noisy_latent, t, h, cfg_scale, condition)
             x_pred = net(z_input, t_input, h_input, w_input, condition_input)
-            return (z_input - x_pred) / t_input.clamp(min=self.t_min)
+            return (z_input - x_pred) / t_input
 
         # 3. Calculate v_c and v_u to compute the CFG Target vector (r = t -> h = 0)
         # Note: We wrap evaluations in torch.no_grad() or detach because 
