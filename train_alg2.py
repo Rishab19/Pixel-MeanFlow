@@ -420,7 +420,6 @@ def run_inference(args):
         dataset=dataset,
         cfg_scale=args.cfg_scale,
         n_samples=args.n_samples,
-        save_path="generated_shapes_output.png"
     )
 
     print("Inference and plot export done.")
