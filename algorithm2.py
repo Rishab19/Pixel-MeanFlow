@@ -50,7 +50,7 @@ class PixelMeanFlowGuidanceLoss:
         r = torch.min(s1, s2)
 
         # Self-prediction slice: r = t
-        data_mask = (torch.arange(B, device=device) < int(B * self.data_proportion)).unsqueeze(1)
+        data_mask = (torch.rand((B, 1), device=device) < self.data_proportion)
         r = torch.where(data_mask, t, r)
 
         # Sample CFG scale w uniformly between 1.0 and w_max (or using power law distribution)
