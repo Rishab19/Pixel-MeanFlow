@@ -25,9 +25,9 @@ from torch.utils.data.distributed import DistributedSampler
 
 # ── project modules ──────────────────────────────────────────────────────── #
 # Assumes loss_cfg.py, net_cfg.py, dataset_3d.py are on PYTHONPATH / cwd.
-from loss_cfg    import SwissRollMeanFlowGuidanceLoss   # the loss you provided
-from net_cfg     import MeanFlowGuidanceMLP             # the net  you provided
-from dataset_3d  import ThreeDShapeDataset
+from algorithm2    import SwissRollMeanFlowGuidanceLoss   # the loss you provided
+from alg2_net     import MeanFlowGuidanceMLP             # the net  you provided
+from plot_3d  import ThreeDShapeDataset
 
 
 # ══════════════════════════════════════════════════════════════════════════ #
