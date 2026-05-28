@@ -86,6 +86,11 @@ class PixelMeanFlowGuidanceLoss:
         with torch.no_grad():
             # For v_c and v_u, r is set equal to t, forcing h = 0
             v_c = u_fn_functional(z_t, t, t, w, c_dropped)
+            tangent_norm = v_c_inst.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            max_norm = 5.0
+            v_c_inst = v_c_inst * (
+                torch.clamp(max_norm / tangent_norm, max=1.0)
+            )
             
             # For unconditional path, pass the null token class
             uncond_tokens = torch.full_like(c_dropped, self.uncond_class)
